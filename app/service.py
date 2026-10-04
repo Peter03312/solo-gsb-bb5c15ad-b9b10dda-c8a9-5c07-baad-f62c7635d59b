@@ -80,16 +80,14 @@ class AuditService:
     def current_permit_revision(self) -> int:
         return self.db.current_permit_revision()
 
-    def _resolve_revision(self, raw: Any) -> int:
-        """校验并解析调用方指定的修订号；超出当前范围明确报错 404。"""
-        revision = _validate_revision_param(raw)
-        head = self.db.current_revision()
+    def _check_revision_range(self, conn: Any, revision: int) -> None:
+        """在给定读视图内核对修订号未超出当前范围；超出明确报错 404。"""
+        head = self.db._current_revision(conn)
         if revision > head:
             raise NotFoundError(
                 f"修订号 {revision} 超出当前范围：当前最新修订号为 {head}"
                 + ("（尚无任何区域登记）" if head == 0 else "")
             )
-        return revision
 
     # ------------------------------------------------------------------
     # 危险区登记
@@ -163,8 +161,10 @@ class AuditService:
                 return None
             return _row_to_zone(row)
 
-        revision = self._resolve_revision(revision_raw)
+        revision = _validate_revision_param(revision_raw)
+        # 同一已提交读视图：核对修订号范围并取该区截至该号的版本
         with self.db.read_view() as conn:
+            self._check_revision_range(conn, revision)
             row = self.db._zone_row_at(conn, zone_id, revision)
         if row is None:
             # 指定版本中该区尚未登记
@@ -178,8 +178,10 @@ class AuditService:
             rows = self.db.list_latest_zone_rows()
             return {"zones": [_row_to_zone(r) for r in rows]}
 
-        revision = self._resolve_revision(revision_raw)
+        revision = _validate_revision_param(revision_raw)
+        # 同一已提交读视图：核对修订号范围并取各区截至该号的最后版本
         with self.db.read_view() as conn:
+            self._check_revision_range(conn, revision)
             rows = self.db._list_zone_rows_at(conn, revision)
         return {
             "revision": revision,
@@ -189,18 +191,21 @@ class AuditService:
     def list_revisions(self, zone_id: Optional[str] = None, limit: int = 500) -> Dict[str, Any]:
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > 10000:
             raise ValidationError("limit 必须是 1..10000 的整数")
-        if zone_id is None:
-            rows = self.db.list_revision_rows(limit=limit)
-            payload = {
-                "current_revision": self.db.current_revision(),
-                "revisions": [self._revision_brief(r) for r in rows],
-            }
-            return payload
-        # 按区查看：区当前必须存在（历史曾登记即视为存在，版本不可删除）
-        existing = self.db.latest_zone_row(zone_id)
-        if existing is None:
-            raise NotFoundError(f"危险区不存在: {zone_id}")
-        rows = self.db.list_zone_revision_rows(zone_id)
+        # 同一已提交读视图：当前最新号与流水取自同一快照，不拼接不同提交时刻的数据
+        with self.db.read_view() as conn:
+            if zone_id is None:
+                payload = {
+                    "current_revision": self.db._current_revision(conn),
+                    "revisions": [
+                        self._revision_brief(r)
+                        for r in self.db._list_revision_rows(conn, limit=limit)
+                    ],
+                }
+                return payload
+            # 按区查看：区当前必须存在（历史曾登记即视为存在，版本不可删除）
+            if self.db._latest_zone_row(conn, zone_id) is None:
+                raise NotFoundError(f"危险区不存在: {zone_id}")
+            rows = self.db._list_zone_revision_rows(conn, zone_id)
         return {
             "zone_id": zone_id,
             "revisions": [self._revision_brief(r) for r in rows],
@@ -664,50 +669,45 @@ class AuditService:
             raise ValidationError("since 必须早于 until（查询范围为半开 [since, until)）")
 
         pinned_rev = revision_raw is not None
-        revision = self._resolve_revision(revision_raw) if pinned_rev else None
+        revision = _validate_revision_param(revision_raw) if pinned_rev else None
 
         pinned_track = track_version_raw is not None
-        track_version = (
-            self._resolve_track_version(trip_id, track_version_raw) if pinned_track else None
-        )
 
+        # ---- 同一已提交读视图：修订号/轨迹版本核对 + 区域配置 + 轨迹点集一次快照读取 ----
         with self.db.read_view() as conn:
+            if pinned_rev:
+                self._check_revision_range(conn, revision)
             if pinned_track:
+                track_version = self._validate_track_version_value(track_version_raw)
+                baseline, head = self.db._trip_version_info(conn, trip_id)
+                self._check_track_version_range(trip_id, track_version, baseline, head)
                 points = self.db._list_trip_point_version_rows(
                     conn, trip_id, track_version
                 )
             else:
+                track_version = None
                 points = self.db._list_trip_points(conn, trip_id)
-            if len(points) < 2:
-                result: Dict[str, Any] = {
-                    "trip_id": trip_id,
-                    "point_count": len(points),
-                    "zones": [],
-                }
-                if pinned_track:
-                    result["track_version"] = track_version
+
+            zone_rows: List[Any] = []
+            if len(points) >= 2:
                 if pinned_rev:
-                    result["revision"] = revision
-                return result
+                    zone_rows = self.db._list_zone_rows_at(conn, revision)
+                else:
+                    zone_rows = self.db._list_latest_zone_rows(conn)
+                if zone_id is not None:
+                    zone_rows = [r for r in zone_rows if r["zone_id"] == zone_id]
+                    if not zone_rows:
+                        if pinned_rev:
+                            # 指定版本中尚未登记的区域不参与核算
+                            raise NotFoundError(
+                                f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
+                            )
+                        raise ValidationError(f"危险区不存在: {zone_id}")
 
-            if pinned_rev:
-                zone_rows = self.db._list_zone_rows_at(conn, revision)
-            else:
-                zone_rows = self.db._list_latest_zone_rows(conn)
-            if zone_id is not None:
-                zone_rows = [r for r in zone_rows if r["zone_id"] == zone_id]
-                if not zone_rows:
-                    if pinned_rev:
-                        # 指定版本中尚未登记的区域不参与核算
-                        raise NotFoundError(
-                            f"修订号 {revision} 的配置中危险区尚未登记: {zone_id}"
-                        )
-                    raise ValidationError(f"危险区不存在: {zone_id}")
-
-            zone_results: List[Dict[str, Any]] = []
-            for zrow in zone_rows:
-                zone_result = self._crossing_for_zone(zrow, points, lo, hi)
-                zone_results.append(zone_result)
+        # ---- 离开读事务后再做几何核算（同一快照数据，纯计算）----
+        zone_results: List[Dict[str, Any]] = [
+            self._crossing_for_zone(zrow, points, lo, hi) for zrow in zone_rows
+        ]
 
         result = {
             "trip_id": trip_id,
@@ -737,18 +737,6 @@ class AuditService:
         if version < 0:
             raise ValidationError(f"轨迹版本必须是 >=0 的整数，收到: {version}")
         return version
-
-    def _resolve_track_version(self, trip_id: str, raw: Any) -> int:
-        """校验穿越查询指定的轨迹版本。
-
-        - 必须是 >=0 的整数；
-        - 车次不存在（无任何已保留版本）：404；
-        - 早于该车次最早可追溯基线版本或晚于当前版本：404 明确报错。
-        """
-        version = self._validate_track_version_value(raw)
-        with self.db.read_view() as conn:
-            baseline, head = self.db._trip_version_info(conn, trip_id)
-        return self._check_track_version_range(trip_id, version, baseline, head)
 
     @staticmethod
     def _check_track_version_range(
@@ -953,11 +941,12 @@ class AuditService:
                         raise NotFoundError(f"危险区不存在: {zid}")
                 zone_rows[zid] = zrow
 
-            # 各区占用区间（同一快照数据，纯计算；沿用插值/窗口/带洞边界/半开裁剪规则）
-            coverage: Dict[str, List[Tuple[float, float]]] = {
-                zid: self._coverage_intervals(zrow, points, lo, hi)
-                for zid, zrow in zone_rows.items()
-            }
+        # ---- 离开读事务后再做几何核算：各区占用区间（同一快照数据，纯计算；
+        # 沿用插值/窗口/带洞边界/半开裁剪规则）----
+        coverage: Dict[str, List[Tuple[float, float]]] = {
+            zid: self._coverage_intervals(zrow, points, lo, hi)
+            for zid, zrow in zone_rows.items()
+        }
 
         # ---- 扫描线：逐时刻取同时占用区中的最高权重；权重变化即分段 ----
         event_times = {t for ivs in coverage.values() for s, e in ivs for t in (s, e)}
@@ -1113,7 +1102,7 @@ class AuditService:
                 used_revision = self.db._current_revision(conn)
 
             # 逐区取截至修订号的最后配置（未指定取最新）；未知区/该版本尚未登记明确拒绝
-            zone_data: Dict[str, Dict[str, Any]] = {}
+            zone_rows: Dict[str, Any] = {}
             for zid in zone_limits:
                 if pinned_rev:
                     zrow = self.db._zone_row_at(conn, zid, revision)
@@ -1125,7 +1114,12 @@ class AuditService:
                     zrow = self.db._latest_zone_row(conn, zid)
                     if zrow is None:
                         raise NotFoundError(f"危险区不存在: {zid}")
-                zone_data[zid] = self._prepare_zone(zrow)
+                zone_rows[zid] = zrow
+
+        # ---- 离开读事务后再做几何核算（同一快照数据，纯计算）----
+        zone_data: Dict[str, Dict[str, Any]] = {
+            zid: self._prepare_zone(zrow) for zid, zrow in zone_rows.items()
+        }
 
         # ---- 逐相邻点段求“区内且生效”的覆盖子区间（点间隔超限整段无覆盖）----
         # cover_pieces: [start, end, speed, {zone_id, ...}]
@@ -1333,11 +1327,11 @@ class AuditService:
                     version = 0 if vrow is None else int(vrow["version"])
                 per_trip.append((tid, version, points))
 
-            # 各车占用区间（同一快照数据，纯计算）
-            occupancy: Dict[str, List[Tuple[float, float]]] = {
-                tid: self._coverage_intervals(zrow, points, lo, hi)
-                for tid, _version, points in per_trip
-            }
+        # ---- 离开读事务后再做几何核算：各车占用区间（同一快照数据，纯计算）----
+        occupancy: Dict[str, List[Tuple[float, float]]] = {
+            tid: self._coverage_intervals(zrow, points, lo, hi)
+            for tid, _version, points in per_trip
+        }
 
         # ---- 扫描线分段：车次集合变化即分段，达到阈值才输出，相邻同集合合并 ----
         events = sorted(
@@ -1494,11 +1488,12 @@ class AuditService:
                     version = 0 if vrow is None else int(vrow["version"])
                 per_trip.append((tid, version, points))
 
-            # 各车“轨迹覆盖且位于区内”的时间区间（同一快照数据，纯计算）
-            coverage: Dict[str, List[Tuple[float, float]]] = {
-                tid: self._coverage_intervals(zrow, points, lo, hi)
-                for tid, _version, points in per_trip
-            }
+        # ---- 离开读事务后再做几何核算：各车“轨迹覆盖且位于区内”的时间区间
+        # （同一快照数据，纯计算）----
+        coverage: Dict[str, List[Tuple[float, float]]] = {
+            tid: self._coverage_intervals(zrow, points, lo, hi)
+            for tid, _version, points in per_trip
+        }
 
         # ---- 无序车次对：仅在两车同时位于区内时比较同一时刻平面距离 ----
         points_by_trip = {tid: points for tid, _version, points in per_trip}
@@ -1760,11 +1755,12 @@ class AuditService:
                     version = 0 if vrow is None else int(vrow["version"])
                 per_trip.append((tid, version, points))
 
-            # 各车“轨迹覆盖且位于区内”的时间区间（同一快照数据，纯计算）
-            coverage: Dict[str, List[Tuple[float, float]]] = {
-                tid: self._coverage_intervals(zrow, points, lo, hi)
-                for tid, _version, points in per_trip
-            }
+        # ---- 离开读事务后再做几何核算：各车“轨迹覆盖且位于区内”的时间区间
+        # （同一快照数据，纯计算）----
+        coverage: Dict[str, List[Tuple[float, float]]] = {
+            tid: self._coverage_intervals(zrow, points, lo, hi)
+            for tid, _version, points in per_trip
+        }
 
         # ---- 无序车次对相遇区间：沿用近距离相遇的插值/窗口/带洞/严格小于阈值规则 ----
         points_by_trip = {tid: points for tid, _version, points in per_trip}
@@ -2159,41 +2155,48 @@ class AuditService:
                         raise NotFoundError(f"危险区不存在: {zid}")
                 zone_rows[zid] = zrow
 
-            zone_results: List[Dict[str, Any]] = []
-            for zid in zone_ids:
-                # 实际占用：沿用既有插值/带洞边界/区域生效/半开裁剪规则
-                occupancy = self._coverage_intervals(zone_rows[zid], points, lo, hi)
-                # 仅核对该车次该区、在许可修订视图下仍有效的许可；重叠时段取并集。
-                # 从不可变流水重放，撤销后的许可在撤销前旧视图中仍可见。
-                permit_windows = self.db._active_permit_windows_at(
-                    conn, trip_id, zid, used_permit_revision
+            # 仅核对该车次该区、在许可修订视图下仍有效的许可；重叠时段取并集。
+            # 从不可变流水重放，撤销后的许可在撤销前旧视图中仍可见（同一读视图取数）。
+            permit_unions: Dict[str, List[Tuple[float, float]]] = {
+                zid: merge_windows(
+                    self.db._active_permit_windows_at(
+                        conn, trip_id, zid, used_permit_revision
+                    )
                 )
-                permit_union = merge_windows(permit_windows)
-                licensed = clip_intervals_halfopen(occupancy, permit_union)
-                unlicensed = subtract_intervals_halfopen(occupancy, permit_union)
-                unlicensed = [(s, e) for s, e in unlicensed if e - s > self.min_duration]
+                for zid in zone_ids
+            }
 
-                occupied_sec = sum(e - s for s, e in occupancy)
-                licensed_sec = sum(e - s for s, e in licensed)
-                zone_results.append(
-                    {
-                        "zone_id": zid,
-                        "occupied": bool(occupancy),
-                        "occupied_duration_sec": round(occupied_sec, 6),
-                        "licensed_duration_sec": round(licensed_sec, 6),
-                        "unlicensed_duration_sec": round(
-                            sum(e - s for s, e in unlicensed), 6
-                        ),
-                        "unlicensed_intervals": [
-                            {
-                                "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
-                                "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
-                                "duration_sec": round(e - s, 6),
-                            }
-                            for s, e in unlicensed
-                        ],
-                    }
-                )
+        # ---- 离开读事务后再做几何核算（同一快照数据，纯计算）----
+        zone_results: List[Dict[str, Any]] = []
+        for zid in zone_ids:
+            # 实际占用：沿用既有插值/带洞边界/区域生效/半开裁剪规则
+            occupancy = self._coverage_intervals(zone_rows[zid], points, lo, hi)
+            permit_union = permit_unions[zid]
+            licensed = clip_intervals_halfopen(occupancy, permit_union)
+            unlicensed = subtract_intervals_halfopen(occupancy, permit_union)
+            unlicensed = [(s, e) for s, e in unlicensed if e - s > self.min_duration]
+
+            occupied_sec = sum(e - s for s, e in occupancy)
+            licensed_sec = sum(e - s for s, e in licensed)
+            zone_results.append(
+                {
+                    "zone_id": zid,
+                    "occupied": bool(occupancy),
+                    "occupied_duration_sec": round(occupied_sec, 6),
+                    "licensed_duration_sec": round(licensed_sec, 6),
+                    "unlicensed_duration_sec": round(
+                        sum(e - s for s, e in unlicensed), 6
+                    ),
+                    "unlicensed_intervals": [
+                        {
+                            "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
+                            "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
+                            "duration_sec": round(e - s, 6),
+                        }
+                        for s, e in unlicensed
+                    ],
+                }
+            )
 
         return {
             "trip_id": trip_id,
@@ -2376,11 +2379,12 @@ class AuditService:
                         raise NotFoundError(f"危险区不存在: {zid}")
                 zone_rows[zid] = zrow
 
-            # 各涉及区占用区间（同一快照数据，纯计算；沿用插值/窗口/带洞边界/半开裁剪）
-            occupancy: Dict[str, List[Tuple[float, float]]] = {
-                zid: self._coverage_intervals(zrow, points, lo, hi)
-                for zid, zrow in zone_rows.items()
-            }
+        # ---- 离开读事务后再做几何核算：各涉及区占用区间（同一快照数据，纯计算；
+        # 沿用插值/窗口/带洞边界/半开裁剪）----
+        occupancy: Dict[str, List[Tuple[float, float]]] = {
+            zid: self._coverage_intervals(zrow, points, lo, hi)
+            for zid, zrow in zone_rows.items()
+        }
 
         # ---- 区间传播：求每道工序全部可行的证据开始时刻集（闭区间并）----
         # 证据 [x, x+d) 落在一次连续占用 [s, e) 内 ⟺ x ∈ [s, e−d]；

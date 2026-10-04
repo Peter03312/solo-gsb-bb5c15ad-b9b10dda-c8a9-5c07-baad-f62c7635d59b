@@ -33,11 +33,16 @@
 
 并发
 ----
-- 服务进程内以一把可重入锁串行化对共享连接的访问；写事务使用 ``BEGIN IMMEDIATE``，
-  多进程场景下由 SQLite 写锁保证修订号严格串行。
-- 查询通过只读快照（``BEGIN``/``COMMIT``）一次性读完全部版本行，不会读到半次提交。
-
-- 所有写操作在单个事务中完成，批量失败不写入部分数据。
+- 写事务：进程内以一把可重入锁串行化共享写连接上的访问，并使用 ``BEGIN IMMEDIATE``
+  （多进程场景下由 SQLite 写锁保证修订号严格串行）；所有写操作在单个事务中完成，
+  批量失败不写入部分数据，修订号不重号、不缺号。
+- 读视图：每个 ``read_view`` 从**只读连接池**取一条独立连接并开启只读快照事务
+  （``BEGIN``/``COMMIT``），块内所有读取自同一已提交快照，不会读到半次提交，
+  也不会把不同提交时刻的数据拼进同一结果。WAL 模式下只读快照与并发写互不阻塞：
+  多个审计请求可并行取数，区域登记/轨迹上传/更正/许可登记撤销也不会
+  因其他请求正在核算而排队——耗时核算一律在离开读视图后进行。
+- 读视图无论正常结束还是建立/查询失败，都会结束事务并把连接归还连接池；
+  ``close()`` 关闭写连接并释放池中全部空闲连接（服务关闭时调用）。
 - 重启后数据保留（DZ_DB_PATH 指向持久文件）。
 """
 from __future__ import annotations
@@ -196,13 +201,58 @@ def _connect(settings: Settings) -> sqlite3.Connection:
     return conn
 
 
+class _ReadConnectionPool:
+    """只读连接池：每个读视图独占一条连接，审计核算期间不占用数据库访问。
+
+    - 连接按需创建、用后归还（LIFO 复用），空闲连接数有上限，超出即关闭；
+    - ``close()`` 后池关闭：此后获取连接直接报错，归还的连接一律关闭；
+    - 归还有兜底 ``rollback``，确保不把残留事务带回池中。
+    """
+
+    def __init__(self, settings: Settings, max_idle: int = 8) -> None:
+        self._settings = settings
+        self._max_idle = max(1, int(max_idle))
+        self._idle: List[sqlite3.Connection] = []
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def acquire(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("数据库已关闭，无法建立读视图")
+            if self._idle:
+                return self._idle.pop()
+        return _connect(self._settings)
+
+    def release(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.rollback()  # 兜底：确保无残留事务（正常路径下为 no-op）
+        except sqlite3.Error:
+            conn.close()
+            return
+        with self._lock:
+            if not self._closed and len(self._idle) < self._max_idle:
+                self._idle.append(conn)
+                return
+        conn.close()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            idle, self._idle = self._idle, []
+        for conn in idle:
+            conn.close()
+
+
 class Database:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # 可重入锁：服务进程内串行化共享连接上的所有访问，杜绝读到半次提交
+        # 可重入锁：串行化写事务与共享写连接上的简短直接读取
         self._lock = threading.RLock()
         self._conn = _connect(settings)
+        # 只读连接池：读视图各自独占连接，彼此及与写事务并行不悖
+        self._read_pool = _ReadConnectionPool(settings)
         self.init_schema()
 
     def init_schema(self) -> None:
@@ -363,6 +413,7 @@ class Database:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+        self._read_pool.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -379,9 +430,14 @@ class Database:
 
     @contextmanager
     def read_view(self) -> Iterator[sqlite3.Connection]:
-        """只读快照事务：块内所有读取自同一快照，并发提交在块内不可见。"""
-        conn = self._conn
-        with self._lock:
+        """只读快照事务：独立池化连接，块内所有读取自同一已提交快照。
+
+        WAL 模式下与其他读视图及并发写事务互不阻塞；无论正常结束还是
+        建立/查询失败，都会结束事务并把连接归还只读池。耗时的几何核算
+        应在离开本读视图后进行，以免独占数据库访问。
+        """
+        conn = self._read_pool.acquire()
+        try:
             conn.execute("BEGIN")
             try:
                 yield conn
@@ -389,6 +445,8 @@ class Database:
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+        finally:
+            self._read_pool.release(conn)
 
     # ----- 修订号 ----------------------------------------------------------
 
@@ -487,25 +545,25 @@ class Database:
             )
         )
 
-    def list_revision_rows(self, limit: int = 500) -> List[sqlite3.Row]:
-        with self._lock:
-            return list(
-                self._conn.execute(
-                    "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
-                    "ORDER BY revision DESC LIMIT ?",
-                    (int(limit),),
-                )
+    @staticmethod
+    def _list_revision_rows(conn: sqlite3.Connection, limit: int = 500) -> List[sqlite3.Row]:
+        return list(
+            conn.execute(
+                "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
+                "ORDER BY revision DESC LIMIT ?",
+                (int(limit),),
             )
+        )
 
-    def list_zone_revision_rows(self, zone_id: str) -> List[sqlite3.Row]:
-        with self._lock:
-            return list(
-                self._conn.execute(
-                    "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
-                    "WHERE zone_id = ? ORDER BY revision",
-                    (zone_id,),
-                )
+    @staticmethod
+    def _list_zone_revision_rows(conn: sqlite3.Connection, zone_id: str) -> List[sqlite3.Row]:
+        return list(
+            conn.execute(
+                "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
+                "WHERE zone_id = ? ORDER BY revision",
+                (zone_id,),
             )
+        )
 
     # ----- 轨迹点 ----------------------------------------------------------
 
