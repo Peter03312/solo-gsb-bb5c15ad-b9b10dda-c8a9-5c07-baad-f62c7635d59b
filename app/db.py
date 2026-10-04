@@ -33,9 +33,13 @@
 
 并发
 ----
-- 服务进程内以一把可重入锁串行化对共享连接的访问；写事务使用 ``BEGIN IMMEDIATE``，
-  多进程场景下由 SQLite 写锁保证修订号严格串行。
-- 查询通过只读快照（``BEGIN``/``COMMIT``）一次性读完全部版本行，不会读到半次提交。
+- 进程内写访问使用一条**专用写连接**与一把写锁串行化（``BEGIN IMMEDIATE``）；
+  多进程场景下由 SQLite WAL 的写锁保证修订号严格串行。
+- 读访问使用**独立读连接池**：每个读请求在自己的只读快照事务
+  （``BEGIN``/``COMMIT``）内一次性取齐所需数据后立即归还连接，随后几何核算在
+  事务外完成。因此长时间核算不占用数据库连接，两个审计请求可以并行，
+  读也不会阻塞登记/上传/更正/许可等写操作。
+- 读快照建立或查询失败时事务回滚并归还连接；服务关闭时关闭全部连接。
 
 - 所有写操作在单个事务中完成，批量失败不写入部分数据。
 - 重启后数据保留（DZ_DB_PATH 指向持久文件）。
@@ -43,6 +47,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -182,7 +187,7 @@ CREATE INDEX IF NOT EXISTS idx_permit_revisions_trip_zone_rev
 _LEGACY_TABLES = ("zones", "zone_windows")
 
 
-def _connect(settings: Settings) -> sqlite3.Connection:
+def _connect(settings: Settings, *, readonly: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(
         settings.db_path,
         timeout=30,
@@ -193,6 +198,9 @@ def _connect(settings: Settings) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
+    if readonly:
+        # 双保险：读池连接只允许查询；真正的隔离由快照事务保证
+        conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -200,16 +208,23 @@ class Database:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # 可重入锁：服务进程内串行化共享连接上的所有访问，杜绝读到半次提交
-        self._lock = threading.RLock()
-        self._conn = _connect(settings)
+        # 写路径：一条专用连接 + 一把写锁，进程内所有写事务严格串行。
+        # 读路径走独立连接池，与写锁互不等待（WAL 下读不阻塞写、写不阻塞读）。
+        self._write_lock = threading.Lock()
+        self._writer = _connect(settings)
+        pool_size = max(1, int(settings.read_pool_size))
+        self._read_pool: "queue.Queue[sqlite3.Connection]" = queue.Queue()
+        for _ in range(pool_size):
+            self._read_pool.put(_connect(settings, readonly=True))
+        self._closed = False
         self.init_schema()
 
     def init_schema(self) -> None:
-        with self._lock:
-            self._conn.executescript(_SCHEMA)
-            self._migrate_legacy_zones(self._conn)
-            self._baseline_existing_trips(self._conn)
+        with self._write_lock:
+            conn = self._writer
+            conn.executescript(_SCHEMA)
+            self._migrate_legacy_zones(conn)
+            self._baseline_existing_trips(conn)
 
     def _table_exists(self, conn: sqlite3.Connection, name: str) -> bool:
         cur = conn.execute(
@@ -361,41 +376,81 @@ class Database:
         return True
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """关闭写连接与读池中全部连接（幂等；服务关闭时调用）。"""
+        with self._write_lock:
+            if self._closed:
+                return
+            self._closed = True
+            drained: List[sqlite3.Connection] = []
+            while True:
+                try:
+                    drained.append(self._read_pool.get_nowait())
+                except queue.Empty:
+                    break
+            for conn in drained:
+                conn.close()
+            self._writer.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """写事务：进程锁 + BEGIN IMMEDIATE（多进程时由 SQLite 写锁串行化）。"""
-        conn = self._conn
-        with self._lock:
+        """写事务：写锁 + 专用写连接 + BEGIN IMMEDIATE（多进程时由 SQLite 写锁串行化）。
+
+        只持有锁到提交/回滚为止；耗时的事后处理不应留在事务块内。
+        """
+        conn = self._writer
+        with self._write_lock:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
                 conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
                 conn.execute("ROLLBACK")
                 raise
 
     @contextmanager
     def read_view(self) -> Iterator[sqlite3.Connection]:
-        """只读快照事务：块内所有读取自同一快照，并发提交在块内不可见。"""
-        conn = self._conn
-        with self._lock:
+        """只读快照事务：从读池取一条连接，块内所有读取自同一已提交快照。
+
+        块退出（含异常）即 COMMIT/ROLLBACK 并归还连接；调用方随后可在事务外
+        继续使用取出的不可变数据（sqlite3.Row 已物化为 Python 值）完成几何核算。
+        """
+        conn = self._read_pool.get()
+        try:
             conn.execute("BEGIN")
             try:
                 yield conn
                 conn.execute("COMMIT")
-            except Exception:
+            except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+        finally:
+            # 读视图建立或查询失败也释放连接；服务已关闭则直接关掉
+            if self._closed:
+                conn.close()
+            else:
+                self._read_pool.put(conn)
+
+    @contextmanager
+    def read_connection(self) -> Iterator[sqlite3.Connection]:
+        """无显式事务的只读连接：autocommit 下的单次读取即读已提交数据。
+
+        供不需要跨表同一快照的简单查询使用；需要多表一致时用 :meth:`read_view`。
+        """
+        conn = self._read_pool.get()
+        try:
+            yield conn
+        finally:
+            if self._closed:
+                conn.close()
+            else:
+                self._read_pool.put(conn)
 
     # ----- 修订号 ----------------------------------------------------------
 
     def current_revision(self) -> int:
         """当前全局修订号（尚无任何登记时为 0）。"""
-        with self._lock:
-            return self._current_revision(self._conn)
+        with self.read_connection() as conn:
+            return self._current_revision(conn)
 
     @staticmethod
     def _current_revision(conn: sqlite3.Connection) -> int:
@@ -439,8 +494,8 @@ class Database:
         return cur.fetchone()
 
     def latest_zone_row(self, zone_id: str) -> Optional[sqlite3.Row]:
-        with self._lock:
-            return self._latest_zone_row(self._conn, zone_id)
+        with self.read_connection() as conn:
+            return self._latest_zone_row(conn, zone_id)
 
     @staticmethod
     def _latest_zone_row(conn: sqlite3.Connection, zone_id: str) -> Optional[sqlite3.Row]:
@@ -460,8 +515,8 @@ class Database:
         return cur.fetchone()
 
     def list_latest_zone_rows(self) -> List[sqlite3.Row]:
-        with self._lock:
-            return self._list_latest_zone_rows(self._conn)
+        with self.read_connection() as conn:
+            return self._list_latest_zone_rows(conn)
 
     @staticmethod
     def _list_latest_zone_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
@@ -488,9 +543,9 @@ class Database:
         )
 
     def list_revision_rows(self, limit: int = 500) -> List[sqlite3.Row]:
-        with self._lock:
+        with self.read_connection() as conn:
             return list(
-                self._conn.execute(
+                conn.execute(
                     "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
                     "ORDER BY revision DESC LIMIT ?",
                     (int(limit),),
@@ -498,9 +553,9 @@ class Database:
             )
 
     def list_zone_revision_rows(self, zone_id: str) -> List[sqlite3.Row]:
-        with self._lock:
+        with self.read_connection() as conn:
             return list(
-                self._conn.execute(
+                conn.execute(
                     "SELECT revision, zone_id, created_at, registered_at FROM zone_revisions "
                     "WHERE zone_id = ? ORDER BY revision",
                     (zone_id,),
@@ -510,24 +565,24 @@ class Database:
     # ----- 轨迹点 ----------------------------------------------------------
 
     def get_point(self, trip_id: str, point_id: str) -> Optional[sqlite3.Row]:
-        with self._lock:
-            cur = self._conn.execute(
+        with self.read_connection() as conn:
+            cur = conn.execute(
                 "SELECT * FROM points WHERE trip_id = ? AND point_id = ?",
                 (trip_id, point_id),
             )
             return cur.fetchone()
 
     def find_point_at_ts(self, trip_id: str, ts_epoch: float) -> Optional[sqlite3.Row]:
-        with self._lock:
-            cur = self._conn.execute(
+        with self.read_connection() as conn:
+            cur = conn.execute(
                 "SELECT * FROM points WHERE trip_id = ? AND ts_epoch = ?",
                 (trip_id, ts_epoch),
             )
             return cur.fetchone()
 
     def list_trip_points(self, trip_id: str) -> List[sqlite3.Row]:
-        with self._lock:
-            return self._list_trip_points(self._conn, trip_id)
+        with self.read_connection() as conn:
+            return self._list_trip_points(conn, trip_id)
 
     @staticmethod
     def _list_trip_points(conn: sqlite3.Connection, trip_id: str) -> List[sqlite3.Row]:
@@ -539,8 +594,8 @@ class Database:
         )
 
     def count_trip_points(self, trip_id: str) -> int:
-        with self._lock:
-            cur = self._conn.execute(
+        with self.read_connection() as conn:
+            cur = conn.execute(
                 "SELECT COUNT(*) AS c FROM points WHERE trip_id = ?", (trip_id,)
             )
             return int(cur.fetchone()["c"])
@@ -570,8 +625,8 @@ class Database:
 
     def get_trip_version(self, trip_id: str) -> Optional[int]:
         """当前轨迹版本号；车次从未存在时为 None。"""
-        with self._lock:
-            row = self._trip_version_row(self._conn, trip_id)
+        with self.read_connection() as conn:
+            row = self._trip_version_row(conn, trip_id)
             return None if row is None else int(row["version"])
 
     @staticmethod
@@ -596,8 +651,8 @@ class Database:
         return cur.fetchone()
 
     def is_point_revoked(self, trip_id: str, point_id: str) -> bool:
-        with self._lock:
-            return self._revoked_row(self._conn, trip_id, point_id) is not None
+        with self.read_connection() as conn:
+            return self._revoked_row(conn, trip_id, point_id) is not None
 
     def list_revoked_ids(self, conn: sqlite3.Connection, trip_id: str) -> List[str]:
         return [
@@ -707,8 +762,8 @@ class Database:
         return int(cur.fetchone()["r"])
 
     def current_permit_revision(self) -> int:
-        with self._lock:
-            return self._current_permit_revision(self._conn)
+        with self.read_connection() as conn:
+            return self._current_permit_revision(conn)
 
     @staticmethod
     def _permit_row(conn: sqlite3.Connection, permit_id: str) -> Optional[sqlite3.Row]:
@@ -787,6 +842,27 @@ class Database:
                 (trip_id, zone_id),
             )
         )
+
+    @staticmethod
+    def _active_permit_windows_from_rows(
+        rows: List[sqlite3.Row],
+        revision: Optional[int],
+    ) -> List[Tuple[float, float]]:
+        """从读视图中已取出的许可流水行重放（用于读事务提交后的事务外核算）。
+
+        语义与 :meth:`_active_permit_windows_at` 完全一致：按修订号顺序重放
+        register/revoke，撤销后的许可在其撤销修订号之前的旧视图中仍可见；
+        revision=None 时重放全部流水。
+        """
+        active: Dict[str, Tuple[float, float]] = {}
+        for r in rows:
+            if revision is not None and int(r["revision"]) > revision:
+                break
+            if r["action"] == "register":
+                active[r["permit_id"]] = (r["start_epoch"], r["end_epoch"])
+            else:
+                active.pop(r["permit_id"], None)
+        return list(active.values())
 
     @staticmethod
     def _active_permit_windows_at(

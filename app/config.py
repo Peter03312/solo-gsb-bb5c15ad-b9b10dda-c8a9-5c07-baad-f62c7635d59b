@@ -20,6 +20,8 @@ class Settings:
         self.echo_sql: bool = _env_bool("DZ_ECHO_SQL", False)
         # 小于该秒数的覆盖片段视为零时长接触，不计入穿越
         self.min_duration: float = float(os.getenv("DZ_MIN_DURATION_SEC", "1e-9"))
+        # 只读快照连接池容量：审计核算在读事务外进行，多个读请求各持独立连接并行
+        self.read_pool_size: int = int(os.getenv("DZ_READ_POOL_SIZE", "8"))
 
 
 def get_settings() -> Settings:
